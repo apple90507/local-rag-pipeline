@@ -1,0 +1,18 @@
+# 排除虛擬環境
+.venv/
+venv/
+env/
+
+# 排除含有私有文件的資料夾（你的論文純文字絕對不要公開上傳！）
+data/
+
+# 排除 Windows 系統暫存檔
+Thumbs.db
+Desktop.ini
+
+# 排除 Python 編譯暫存檔
+__pycache__/
+*.pyc
+
+# 排除可能包含 API Key 的環境變數設定檔
+.env
