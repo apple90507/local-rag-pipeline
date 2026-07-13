@@ -1,4 +1,6 @@
 import os
+import hashlib
+import json
 from llama_index.core import (
     VectorStoreIndex,
     SimpleDirectoryReader,
@@ -23,15 +25,47 @@ def init_settings():
     Settings.embed_model = OllamaEmbedding(model_name="nomic-embed-text")
     Settings.node_parser = SentenceSplitter(chunk_size=256, chunk_overlap=30)
 
-def get_vector_index(persist_dir="./storage", data_dir="data"):
-    """Load index from local storage if exists, otherwise build a new one."""
+def calculate_dir_md5(data_dir="data"):
+    """Calculate a single MD5 hash representing all files in the data directory."""
+    hasher = hashlib.md5()
+    if not os.path.exists(data_dir):
+        return ""
+    
+    # Sort file names to ensure deterministic hash order
+    for file_name in sorted(os.listdir(data_dir)):
+        file_path = os.path.join(data_dir, file_name)
+        if os.path.isfile(file_path):
+            with open(file_path, "rb") as f:
+                # Read in chunks to prevent memory overflow for large files
+                for chunk in iter(lambda: f.read(4096), b""):
+                    hasher.update(chunk)
+    return hasher.hexdigest()
+
+def verify_cache_integrity(persist_dir, current_md5):
+    """Verify if the local vector cache matches the current data MD5."""
+    manifest_path = os.path.join(persist_dir, "cache_manifest.json")
     docstore_path = os.path.join(persist_dir, "docstore.json")
     
-    if os.path.exists(persist_dir) and os.path.exists(docstore_path):
+    # Check if necessary cache files exist
+    if not (os.path.exists(persist_dir) and os.path.exists(docstore_path) and os.path.exists(manifest_path)):
+        return False
+        
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        return manifest.get("data_md5") == current_md5
+    except (json.JSONDecodeError, IOError):
+        return False
+
+def get_vector_index(persist_dir="./storage", data_dir="data"):
+    """Load index from local storage if valid, otherwise rebuild and cache it."""
+    current_md5 = calculate_dir_md5(data_dir)
+    
+    if verify_cache_integrity(persist_dir, current_md5):
         storage_context = StorageContext.from_defaults(persist_dir=persist_dir)
         return load_index_from_storage(storage_context)
     
-    # Ingest documents using PyMuPDFReader for accurate PDF parsing
+    # Cache miss or corrupted: Trigger re-indexing
     documents = SimpleDirectoryReader(
         data_dir, 
         file_extractor={".pdf": PyMuPDFReader()}
@@ -39,6 +73,12 @@ def get_vector_index(persist_dir="./storage", data_dir="data"):
     
     index = VectorStoreIndex.from_documents(documents)
     index.storage_context.persist(persist_dir=persist_dir)
+    
+    # Write the current MD5 hash into the manifest file
+    manifest_path = os.path.join(persist_dir, "cache_manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump({"data_md5": current_md5}, f, ensure_ascii=False, indent=4)
+        
     return index
 
 def main():
