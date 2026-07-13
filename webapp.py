@@ -1,6 +1,7 @@
 import os
 import hashlib
 import json
+import sqlite3
 import streamlit as st
 from llama_index.core import (
     VectorStoreIndex,
@@ -16,9 +17,60 @@ from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.readers.file import PyMuPDFReader
 from sentence_transformers import CrossEncoder
 
+DB_PATH = "chat_history.db"
+
+# ==================== 1. Database Layer (SQLite3) ====================
+
+def init_db():
+    """Initialize SQLite database and create chat history table if not exists."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chat_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                role TEXT,
+                content TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+
+def save_message_to_db(session_id, role, content):
+    """Persist a single chat message into the database."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO chat_logs (session_id, role, content) VALUES (?, ?, ?)",
+            (session_id, role, content)
+        )
+        conn.commit()
+
+def load_chat_history_from_db(session_id, limit=None):
+    """Fetch chat history from database. Supports sliding window via LIMIT."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        if limit:
+            cursor.execute(
+                "SELECT role, content FROM chat_logs WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?",
+                (session_id, limit)
+            )
+            rows = cursor.fetchall()
+            return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+        else:
+            cursor.execute(
+                "SELECT role, content FROM chat_logs WHERE session_id = ? ORDER BY timestamp ASC",
+                (session_id,)
+            )
+            rows = cursor.fetchall()
+            return [{"role": r["role"], "content": r["content"]} for r in rows]
+
+# ==================== 2. Resource Caching Layer ====================
+
 @st.cache_resource
 def init_global_settings():
-    """Initialize core LLM and Embedding components."""
+    """Initialize core LLM and Embedding components inside global cache."""
     Settings.llm = Ollama(
         model="llama3",
         request_timeout=120.0,
@@ -29,11 +81,11 @@ def init_global_settings():
 
 @st.cache_resource
 def load_rerank_model():
-    """Load Cross-Encoder model into resource cache."""
+    """Load Cross-Encoder model into resource cache to prevent memory leaks."""
     return CrossEncoder("BAAI/bge-reranker-base")
 
 def calculate_dir_md5(data_dir="data"):
-    """Calculate MD5 fingerprint of the target directory."""
+    """Calculate MD5 fingerprint of the target directory with chunking."""
     hasher = hashlib.md5()
     if not os.path.exists(data_dir):
         return ""
@@ -46,7 +98,7 @@ def calculate_dir_md5(data_dir="data"):
     return hasher.hexdigest()
 
 def verify_cache_integrity(persist_dir, current_md5):
-    """Verify metadata manifest for database caching."""
+    """Verify metadata manifest for vector storage validation."""
     manifest_path = os.path.join(persist_dir, "cache_manifest.json")
     docstore_path = os.path.join(persist_dir, "docstore.json")
     if not (os.path.exists(persist_dir) and os.path.exists(docstore_path) and os.path.exists(manifest_path)):
@@ -75,13 +127,15 @@ def get_vector_index(current_md5, persist_dir="./storage", data_dir="data"):
         json.dump({"data_md5": current_md5}, f, ensure_ascii=False, indent=4)
     return index
 
-def rewrite_query_with_history(current_query, chat_history):
-    """Refactor sequential queries into a standalone contextualized query."""
-    if not chat_history:
+# ==================== 3. Contextual Query Rewriting Engine ====================
+
+def rewrite_query_with_history(current_query, db_history):
+    """Refactor sequential sub-queries into a standalone query based on database context."""
+    if not db_history:
         return current_query
         
     history_str = ""
-    for msg in chat_history[-4:]:
+    for msg in db_history:
         role_label = "User" if msg["role"] == "user" else "AI"
         history_str += f"{role_label}: {msg['content']}\n"
         
@@ -102,15 +156,19 @@ def rewrite_query_with_history(current_query, chat_history):
 
     return Settings.llm.complete(prompt).text.strip()
 
+# ==================== 4. UI Layer & Orchestration ====================
+
 def main():
     st.set_page_config(page_title="Enterprise RAG System", page_icon="⚙️", layout="wide")
     st.title("Enterprise RAG Engine")
-    st.caption("Two-Stage Retrieval Pipeline with Cryptographic Cache Invalidation")
+    st.caption("Two-Stage Retrieval Pipeline with SQLite Session Persistence")
     
+    init_db()
     init_global_settings()
     rerank_model = load_rerank_model()
     
-    # 側邊欄改造成極簡的系統儀表板
+    CURRENT_SESSION = "default_user_session"
+    
     with st.sidebar:
         st.subheader("System Status")
         current_md5 = calculate_dir_md5("data")
@@ -122,25 +180,24 @@ def main():
             st.warning(status_msg)
             
         st.text_input("Repository Hash (MD5)", value=current_md5, disabled=True)
+        st.caption("Database Engine: SQLite3 (Local)")
 
     index = get_vector_index(current_md5)
+    ui_messages = load_chat_history_from_db(CURRENT_SESSION)
 
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-
-    for message in st.session_state.messages:
+    for message in ui_messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
     if query_str := st.chat_input("Ask a question about the repository..."):
-        st.session_state.messages.append({"role": "user", "content": query_str})
+        save_message_to_db(CURRENT_SESSION, "user", query_str)
         with st.chat_message("user"):
             st.markdown(query_str)
 
         with st.chat_message("assistant"):
-            with st.spinner("Processing context..."):
-                search_query = rewrite_query_with_history(query_str, st.session_state.messages[:-1])
-            
+            with st.spinner("Processing context from database..."):
+                sliding_window_history = load_chat_history_from_db(CURRENT_SESSION, limit=4)
+                search_query = rewrite_query_with_history(query_str, sliding_window_history[:-1])
             
             st.caption(f"Optimized Search Query: `{search_query}`")
             
@@ -164,14 +221,12 @@ def main():
                 response = synthesizer.synthesize(query_str, nodes=reranked_nodes)
                 
                 st.markdown(response)
+                save_message_to_db(CURRENT_SESSION, "assistant", str(response))
                 
-                # Reranking Diagnostics
                 with st.expander("Retrieval & Reranking Diagnostics"):
                     for i, node_with_score in enumerate(reranked_nodes):
                         st.markdown(f"**Rank {i+1} Node** | Score: `{node_with_score.score:.4f}` | Source: `{node_with_score.node.metadata.get('file_name')}`")
                         st.code(node_with_score.node.get_content()[:200] + "...", language="text")
-
-        st.session_state.messages.append({"role": "assistant", "content": str(response)})
 
 if __name__ == "__main__":
     main()
