@@ -13,14 +13,15 @@ from llama_index.core import (
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.readers.file import PyMuPDFReader
+from llama_index.core.schema import NodeWithScore
 from sentence_transformers import CrossEncoder
+from rank_bm25 import BM25Okapi
 
 # ==================== 1. Resource Initialization Layer ====================
 
 def init_global_settings():
     """Initialize core embedding and optimized node parsing configurations."""
     Settings.embed_model = OllamaEmbedding(model_name="nomic-embed-text")
-    # 優化點 1：將 Chunk Size 擴張至 512，確保碩博士論文長句的語意完整性
     Settings.node_parser = SentenceSplitter(chunk_size=512, chunk_overlap=50)
 
 def calculate_dir_md5(data_dir="data"):
@@ -66,13 +67,56 @@ def get_vector_index(persist_dir="./storage", data_dir="data"):
         json.dump({"data_md5": current_md5}, f, ensure_ascii=False, indent=4)
     return index
 
-# ==================== 2. Evaluation Core Pipeline ====================
+# ==================== 2. Advanced Search Algorithms ====================
+
+def tokenize_chinese(text):
+    """Character-level tokenization for CJK, word-level for alphanumeric."""
+    text = text.lower()
+    return re.findall(r'[\u4e00-\u9fff]|[a-zA-Z0-9]+', text)
+
+def get_raw_node(item):
+    """Helper to extract raw node from NodeWithScore or Node directly."""
+    if hasattr(item, "node"):
+        return item.node
+    return item
+
+def get_node_id(item):
+    if hasattr(item, "node"):
+        return item.node.node_id
+    return item.node_id
+
+def reciprocal_rank_fusion(vector_nodes, bm25_nodes, k=60):
+    """
+    Reciprocal Rank Fusion (RRF) Algorithm.
+    Fuses rankings from different retrieval paradigms without normalization issues.
+    """
+    rrf_scores = {}
+    node_map = {}
+    
+    # Process vector rankings
+    for rank, item in enumerate(vector_nodes):
+        nid = get_node_id(item)
+        node_map[nid] = get_raw_node(item)
+        rrf_scores[nid] = rrf_scores.get(nid, 0.0) + 1.0 / (k + (rank + 1))
+        
+    # Process BM25 rankings
+    for rank, item in enumerate(bm25_nodes):
+        nid = get_node_id(item)
+        node_map[nid] = get_raw_node(item)
+        rrf_scores[nid] = rrf_scores.get(nid, 0.0) + 1.0 / (k + (rank + 1))
+        
+    # Sort descending by RRF score
+    sorted_items = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+    
+    # Wrap back to NodeWithScore for Cross-Encoder compatibility
+    fused_nodes = []
+    for nid, score in sorted_items:
+        fused_nodes.append(NodeWithScore(node=node_map[nid], score=score))
+    return fused_nodes
+
+# ==================== 3. Evaluation Core Pipeline ====================
 
 def get_golden_dataset():
-    """
-    Define the evaluation benchmark dataset (Golden QA Pairs).
-    優化點 2：移除口語與誌謝雜訊字眼，改為高特徵密度的標準檢索語句。
-    """
     return [
         {
             "query": "DiCE 反事實解釋與特徵重要性分析之價值不同點",
@@ -93,24 +137,51 @@ def get_golden_dataset():
     ]
 
 def clean_text(text):
-    """優化點 3：移除所有空格、換行與特殊符號，徹底消除 PDF 斷字對字串比對造成的干擾"""
     return re.sub(r'\s+', '', text)
 
-def evaluate_pipeline(index, golden_data, rerank_model=None, top_k_retrieval=5, top_k_final=2):
+def evaluate_pipeline(
+    index, 
+    golden_data, 
+    rerank_model=None, 
+    use_hybrid=False, 
+    all_nodes=None, 
+    bm25_engine=None, 
+    top_k_retrieval=10, 
+    top_k_final=2
+):
     total_queries = len(golden_data)
     hits = 0
     rr_sum = 0.0
     latencies = []
 
-    retriever = index.as_retriever(similarity_top_k=top_k_retrieval)
+    vector_retriever = index.as_retriever(similarity_top_k=top_k_retrieval)
 
     for item in golden_data:
         query_str = item["query"]
-        target_keyword = clean_text(item["ground_truth_keyword"]) # 清洗關鍵字
+        target_keyword = clean_text(item["ground_truth_keyword"])
 
         start_time = time.time()
-        retrieved_nodes = retriever.retrieve(query_str)
         
+        # --- Stage 1: Retrieval ---
+        if use_hybrid:
+            # Vector Retrieval
+            vector_results = vector_retriever.retrieve(query_str)
+            # BM25 Retrieval
+            query_tokens = tokenize_chinese(query_str)
+            bm25_scores = bm25_engine.get_scores(query_tokens)
+            # Fetch Top-K BM25 nodes
+            indexed_scores = sorted(enumerate(bm25_scores), key=lambda x: x[1], reverse=True)
+            bm25_results = []
+            for idx, score in indexed_scores[:top_k_retrieval]:
+                if score > 0:
+                    bm25_results.append(all_nodes[idx])
+            
+            # --- Stage 1.5: Reciprocal Rank Fusion ---
+            retrieved_nodes = reciprocal_rank_fusion(vector_results, bm25_results, k=60)
+        else:
+            retrieved_nodes = vector_retriever.retrieve(query_str)
+        
+        # --- Stage 2: Cross-Encoder Reranking ---
         if rerank_model:
             pairs = [[query_str, node.node.get_content()] for node in retrieved_nodes]
             rerank_scores = rerank_model.predict(pairs)
@@ -126,7 +197,6 @@ def evaluate_pipeline(index, golden_data, rerank_model=None, top_k_retrieval=5, 
         rank_position = 0
         
         for index_idx, node in enumerate(final_nodes):
-            # 關鍵優化：將抽出來的 Chunk 內容也進行全面清洗再做包含比對
             processed_content = clean_text(node.node.get_content())
             if target_keyword in processed_content:
                 hit_found = True
@@ -143,7 +213,7 @@ def evaluate_pipeline(index, golden_data, rerank_model=None, top_k_retrieval=5, 
 
     return avg_hit_rate, avg_mrr, avg_latency
 
-# ==================== 3. Execution & Performance Reporting ====================
+# ==================== 4. Execution & Performance Reporting ====================
 
 def main():
     print("=" * 60)
@@ -160,58 +230,69 @@ def main():
 
     golden_data = get_golden_dataset()
     
-    # 1. Evaluate Baseline Pipeline (Vector Search Only)
-    print("\n[Evaluating] Pipeline Alpha: Base Vector Retrieval (No Rerank)...")
-    base_hit, base_mrr, base_lat = evaluate_pipeline(
-        index, golden_data, rerank_model=None, top_k_retrieval=10, top_k_final=2
+    # 建立 BM25 語料庫
+    all_nodes = list(index.docstore.docs.values())
+    corpus = [tokenize_chinese(node.get_content()) for node in all_nodes]
+    bm25_engine = BM25Okapi(corpus)
+    
+    # 1. Pipeline Alpha: Base Vector Search Only (No Rerank)
+    print("\n[Evaluating] Pipeline Alpha: Base Vector Retrieval...")
+    alpha_hit, alpha_mrr, alpha_lat = evaluate_pipeline(
+        index, golden_data, rerank_model=None, use_hybrid=False, top_k_retrieval=10, top_k_final=2
     )
     
-    # 2. Evaluate Advanced Pipeline (Two-Stage with Cross-Encoder)
-    print("[Evaluating] Pipeline Beta: Two-Stage Retrieval (With BGE Reranker)...")
+    # 2. Pipeline Beta: Two-Stage (Bi + Cross-Encoder)
+    print("[Evaluating] Pipeline Beta: Two-Stage Retrieval (No Hybrid)...")
     rerank_model = CrossEncoder("BAAI/bge-reranker-base")
-    adv_hit, adv_mrr, adv_lat = evaluate_pipeline(
-        index, golden_data, rerank_model=rerank_model, top_k_retrieval=10, top_k_final=2
+    beta_hit, beta_mrr, beta_lat = evaluate_pipeline(
+        index, golden_data, rerank_model=rerank_model, use_hybrid=False, top_k_retrieval=10, top_k_final=2
     )
     
-    # 3. Print Quantitative Comparison Report Table
-    print("\n" + "=" * 65)
-    print(f"{'Retrieval Pipeline Architecture':<35} | {'Hit Rate':<8} | {'MRR':<5} | {'Latency':<7}")
-    print("-" * 65)
-    print(f"{'Base Vector Search (Bi-Encoder Only)':<35} | {base_hit:>7.2f}% | {base_mrr:.3f} | {base_lat:.3f}s")
-    print(f"{'Two-Stage Pipeline (Bi + Cross-Encoder)':<35} | {adv_hit:>7.2f}% | {adv_mrr:.3f} | {adv_lat:.3f}s")
-    print("=" * 65)
+    # 3. Pipeline Gamma: Hybrid Two-Stage (Vector & BM25 + RRF + Cross-Encoder)
+    print("[Evaluating] Pipeline Gamma: Hybrid Two-Stage with RRF Fusion...")
+    gamma_hit, gamma_mrr, gamma_lat = evaluate_pipeline(
+        index, 
+        golden_data, 
+        rerank_model=rerank_model, 
+        use_hybrid=True, 
+        all_nodes=all_nodes, 
+        bm25_engine=bm25_engine, 
+        top_k_retrieval=10, 
+        top_k_final=2
+    )
+    
+    # 4. Print Quantitative Comparison Report Table
+    print("\n" + "=" * 80)
+    print(f"{'Retrieval Pipeline Architecture':<45} | {'Hit Rate':<8} | {'MRR':<5} | {'Latency':<7}")
+    print("-" * 80)
+    print(f"{'Alpha: Base Vector Search (Bi-Encoder Only)':<45} | {alpha_hit:>7.2f}% | {alpha_mrr:.3f} | {alpha_lat:.3f}s")
+    print(f"{'Beta: Two-Stage (Bi + Cross-Encoder)':<45} | {beta_hit:>7.2f}% | {beta_mrr:.3f} | {beta_lat:.3f}s")
+    print(f"{'Gamma: Hybrid Two-Stage (BM25 + Vector + RRF + CE)':<45} | {gamma_hit:>7.2f}% | {gamma_mrr:.3f} | {gamma_lat:.3f}s")
+    print("=" * 80)
 
-    # 4. 核心補強：將消融實驗數據序列化存入硬碟 (MLOps Production Standard)
+    # 5. Persist Results to Disk
     report_path = "evaluation_report.json"
     report_data = {
-        "benchmark_version": "1.0.0",
+        "benchmark_version": "2.0.0",
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
         "configuration": {
             "chunk_size": 512,
             "chunk_overlap": 50,
             "top_k_retrieval": 10,
             "top_k_final": 2,
-            "embedding_model": "nomic-embed-text",
-            "rerank_model": "bge-reranker-base"
+            "rrf_k_constant": 60
         },
         "results": {
-            "baseline_pipeline": {
-                "hit_rate_pct": round(base_hit, 2),
-                "mrr": round(base_mrr, 3),
-                "avg_latency_sec": round(base_lat, 3)
-            },
-            "two_stage_pipeline": {
-                "hit_rate_pct": round(adv_hit, 2),
-                "mrr": round(adv_mrr, 3),
-                "avg_latency_sec": round(adv_lat, 3)
-            }
+            "pipeline_alpha": {"hit_rate_pct": round(alpha_hit, 2), "mrr": round(alpha_mrr, 3), "avg_latency_sec": round(alpha_lat, 3)},
+            "pipeline_beta": {"hit_rate_pct": round(beta_hit, 2), "mrr": round(beta_mrr, 3), "avg_latency_sec": round(beta_lat, 3)},
+            "pipeline_gamma": {"hit_rate_pct": round(gamma_hit, 2), "mrr": round(gamma_mrr, 3), "avg_latency_sec": round(gamma_lat, 3)}
         }
     }
     
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report_data, f, ensure_ascii=False, indent=4)
     
-    print(f"\n[Success] 數據報表已成功固化至實體硬碟：'{report_path}'")
+    print(f"\n[Success] 混合檢索數據報表已更新：'{report_path}'")
 
 if __name__ == "__main__":
     main()

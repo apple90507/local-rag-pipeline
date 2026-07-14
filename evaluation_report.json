@@ -1,0 +1,28 @@
+{
+    "benchmark_version": "2.0.0",
+    "timestamp": "2026-07-14 12:23:40",
+    "configuration": {
+        "chunk_size": 512,
+        "chunk_overlap": 50,
+        "top_k_retrieval": 10,
+        "top_k_final": 2,
+        "rrf_k_constant": 60
+    },
+    "results": {
+        "pipeline_alpha": {
+            "hit_rate_pct": 25.0,
+            "mrr": 0.125,
+            "avg_latency_sec": 2.157
+        },
+        "pipeline_beta": {
+            "hit_rate_pct": 50.0,
+            "mrr": 0.5,
+            "avg_latency_sec": 0.947
+        },
+        "pipeline_gamma": {
+            "hit_rate_pct": 75.0,
+            "mrr": 0.5,
+            "avg_latency_sec": 0.404
+        }
+    }
+}
